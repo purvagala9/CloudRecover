@@ -1,0 +1,5 @@
+.env
+cloudrecover.json
+cloudrecover.tmp
+__pycache__/
+venv/
