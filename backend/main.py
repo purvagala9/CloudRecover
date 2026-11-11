@@ -8,8 +8,9 @@ import subprocess
 import tarfile
 import tempfile
 import threading
-import contextvars
 import base64
+import sys
+import contextvars
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = ROOT / "backup-engine" / "backup.py"
 load_dotenv(ROOT / "backup-engine" / ".env")
 load_dotenv(ROOT / "backend" / ".env", override=False)
+os.environ.setdefault("AWS_PROFILE", "cloudrecover-dev")
 CONFIG_PATH = Path(os.getenv("CLOUDRECOVER_CONFIG", ROOT / "backend" / "cloudrecover.json"))
 DEFAULT_CONFIG = {
     "source_type": "database",
@@ -63,6 +65,8 @@ def current_user(request: Request):
         payload = encoded.split(".", 1)[1]
         payload += "=" * (-len(payload) % 4)
         data = json.loads(base64.urlsafe_b64decode(payload))
+        if data.get("role") not in {"admin", "client"}:
+            raise ValueError("role")
         if data["expires"] < int(datetime.now(timezone.utc).timestamp()):
             raise ValueError("expired")
         if data["role"] == "client" and not any(c["id"] == data.get("client_id") for c in load_config()["clients"]):
@@ -70,13 +74,6 @@ def current_user(request: Request):
         return data
     except Exception:
         raise HTTPException(status_code=401, detail="Please sign in.")
-
-
-def require_admin(request: Request):
-    user = current_user(request)
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Central administration access required.")
-    return user
 
 
 def current_user_from_context():
@@ -100,8 +97,10 @@ def scoped_client(config, user):
 def load_config():
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         data = {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"CloudRecover configuration is invalid JSON: {CONFIG_PATH}") from exc
     if "clients" not in data:
         legacy_id = "local-database"
         data["clients"] = [{
@@ -182,7 +181,7 @@ def perform_backup(source="manual", client_id=None):
         if client["id"] != "local-database":
             prefix = os.getenv("S3_PREFIX", "cloudrecover/backups").strip("/")
             env["S3_PREFIX"] = f"{prefix + '/' if prefix else ''}clients/{client['id']}"
-        command = [os.getenv("CLOUDRECOVER_PYTHON", "python"), str(ENGINE)]
+        command = [os.getenv("CLOUDRECOVER_PYTHON", sys.executable), str(ENGINE)]
         started = datetime.now(timezone.utc)
         result = subprocess.run(command, cwd=ENGINE.parent, env=env, capture_output=True, text=True, timeout=3600)
         finished = datetime.now(timezone.utc)
@@ -381,13 +380,19 @@ async def authenticate_api(request: Request, call_next):
             user = current_user(request)
         except HTTPException as exc:
             from fastapi.responses import JSONResponse
-            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            response.headers["Cache-Control"] = "no-store"
+            return response
         token = request_user.set(user)
         try:
-            return await call_next(request)
+            response = await call_next(request)
         finally:
             request_user.reset(token)
-    return await call_next(request)
+    else:
+        response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 class AutomationUpdate(BaseModel):
@@ -418,7 +423,9 @@ class ClientCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     website_url: str = Field(default="", max_length=2048)
     database_type: str = Field(default="mongodb", pattern=r"^(mongodb|mysql-container|none)$")
+    database_container: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     database_name: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_$-]*$")
+    database_user: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_.@-]*$")
     mongodb_uri: str = Field(default="", max_length=4096)
     sftp_host: str = Field(default="", max_length=253, pattern=r"^[A-Za-z0-9.-]*$")
     sftp_port: int = Field(default=22, ge=1, le=65535)
@@ -459,8 +466,11 @@ def login(credentials: LoginInput, response: Response):
         role, client_id, display_name = "admin", None, "Central administration"
     else:
         config = load_config()
-        client = next((item for item in config["clients"] if item["name"].casefold() == username.casefold()), None)
-        if not client or not hmac.compare_digest(password, client["name"] + "$123"):
+        matches = [item for item in config["clients"] if item["name"].casefold() == username.casefold()]
+        if len(matches) != 1:
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+        client = matches[0]
+        if not hmac.compare_digest(password, client["name"] + "$123"):
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         role, client_id, display_name = "client", client["id"], client["name"]
     response.set_cookie(SESSION_COOKIE, make_session(role, client_id), httponly=True, secure=os.getenv("CLOUDRECOVER_COOKIE_SECURE", "false").lower() == "true", samesite="strict", max_age=SESSION_TTL_SECONDS, path="/")
@@ -494,7 +504,7 @@ def status():
     is_admin = user["role"] == "admin"
     visible_history = ([{**entry, "client_name": item["name"]} for item in config["clients"] for entry in item.get("history", [])] if is_admin else client.get("history", []))
     visible_history.sort(key=lambda item: item.get("finished_at", item.get("started_at", "")), reverse=True)
-    return {"role": user["role"], "client": public_client(client), "clients": [public_client(item) for item in config["clients"]] if is_admin else [public_client(client)], "selected_client_id": client["id"], "source_type": client["source_type"], "database": client.get("database", {}), "website": {key: value for key, value in client.get("website", {}).items() if key != "private_key_path"}, "website_private_key_configured": bool(client.get("website", {}).get("private_key_path")), "mongo": {"database": client.get("mongo", {}).get("database", ""), "configured": bool(client.get("mongo", {}).get("uri_encrypted"))}, "automation": client["automation"], "history": visible_history[:50], "last_success": last_success, "bucket": os.getenv("S3_BUCKET", "Configured in backup service environment"), "region": os.getenv("AWS_REGION", "ap-southeast-2")}
+    return {"role": user["role"], "client": public_client(client), "clients": [public_client(item) for item in config["clients"]] if is_admin else [public_client(client)], "selected_client_id": client["id"], "source_type": client["source_type"], "database": client.get("database", {}), "website": {key: value for key, value in client.get("website", {}).items() if key != "private_key_path"}, "website_private_key_configured": bool(client.get("website", {}).get("private_key_path")), "mongo": {"database": client.get("mongo", {}).get("database", ""), "configured": bool(client.get("mongo", {}).get("uri_encrypted"))}, "automation": client["automation"], "history": visible_history, "last_success": last_success, "bucket": os.getenv("S3_BUCKET", "Configured in backup service environment"), "region": os.getenv("AWS_REGION", "ap-southeast-2")}
 
 
 @app.get("/api/clients")
@@ -510,10 +520,15 @@ def list_clients():
 @app.post("/api/clients", status_code=201)
 def create_client(client_input: ClientCreate):
     require_admin_from_context()
+    client_name = client_input.name.strip()
+    if len(client_name) < 2:
+        raise HTTPException(status_code=422, detail="Client name must have at least two non-space characters.")
     if client_input.database_type == "none" and not client_input.sftp_host:
         raise HTTPException(status_code=422, detail="Add an SFTP website source or choose a database to protect.")
     if client_input.database_type == "mysql-container" and client_input.sftp_host:
         raise HTTPException(status_code=422, detail="This local MySQL profile cannot be combined with remote SFTP files yet. Use MongoDB for a website database profile.")
+    if client_input.database_type == "mysql-container" and (not client_input.database_container or not client_input.database_name or not client_input.database_user):
+        raise HTTPException(status_code=422, detail="Docker container name, database name, and database user are required for a local Docker profile.")
     if client_input.database_type == "mongodb" and not client_input.mongodb_uri:
         raise HTTPException(status_code=422, detail="MongoDB connection URI is required when MongoDB is selected.")
     if client_input.mongodb_uri and not client_input.mongodb_uri.startswith(("mongodb://", "mongodb+srv://")):
@@ -530,7 +545,9 @@ def create_client(client_input: ClientCreate):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     with lock:
         config = load_config()
-        base = "".join(ch.lower() if ch.isalnum() else "-" for ch in client_input.name).strip("-")[:48] or "client"
+        if any(item["name"].casefold() == client_name.casefold() for item in config["clients"]):
+            raise HTTPException(status_code=409, detail="A client with this name already exists; client names are used as login IDs.")
+        base = "".join(ch.lower() if ch.isalnum() else "-" for ch in client_name).strip("-")[:48] or "client"
         client_id = base
         suffix = 2
         existing = {item["id"] for item in config["clients"]}
@@ -538,9 +555,9 @@ def create_client(client_input: ClientCreate):
             client_id = f"{base}-{suffix}"
             suffix += 1
         profile = {
-            "id": client_id, "name": client_input.name, "website_url": client_input.website_url,
+            "id": client_id, "name": client_name, "website_url": client_input.website_url.strip(),
             "source_type": "website" if client_input.database_type in {"mongodb", "none"} else "database",
-            "database": {**DEFAULT_CONFIG["database"], "type": client_input.database_type, "name": client_input.database_name or DEFAULT_CONFIG["database"]["name"]},
+            "database": {**DEFAULT_CONFIG["database"], "type": client_input.database_type, "container": client_input.database_container or DEFAULT_CONFIG["database"]["container"], "name": client_input.database_name or DEFAULT_CONFIG["database"]["name"], "user": client_input.database_user or DEFAULT_CONFIG["database"]["user"]},
             "website": {"site_id": client_id, "host": client_input.sftp_host, "port": client_input.sftp_port, "username": client_input.sftp_username, "remote_path": client_input.sftp_path or "/var/www/html", "private_key_path": client_input.sftp_key_path},
             "mongo": {"database": client_input.database_name, "uri_encrypted": encrypted_uri},
             "automation": {**DEFAULT_CONFIG["automation"]}, "history": [],
@@ -564,6 +581,7 @@ def select_client(client_id: str):
 
 @app.put("/api/automation")
 def update_automation(update: AutomationUpdate):
+    require_admin_from_context()
     user = current_user_from_context()
     with lock:
         config = load_config()
@@ -578,6 +596,7 @@ def update_automation(update: AutomationUpdate):
 
 @app.put("/api/database")
 def update_database(update: DatabaseUpdate):
+    require_admin_from_context()
     user = current_user_from_context()
     with lock:
         config = load_config()
@@ -588,6 +607,7 @@ def update_database(update: DatabaseUpdate):
 
 @app.put("/api/website")
 def update_website(update: WebsiteUpdate):
+    require_admin_from_context()
     user = current_user_from_context()
     path_parts = Path(update.remote_path).parts
     if ".." in path_parts or "\x00" in update.remote_path:
@@ -605,6 +625,7 @@ def update_website(update: WebsiteUpdate):
 
 @app.put("/api/source")
 def update_source(update: SourceUpdate):
+    require_admin_from_context()
     user = current_user_from_context()
     with lock:
         config = load_config()
@@ -615,6 +636,7 @@ def update_source(update: SourceUpdate):
 
 @app.post("/api/backups", status_code=202)
 def trigger_backup():
+    require_admin_from_context()
     user = current_user_from_context()
     config = load_config()
     return start_backup(scoped_client(config, user)["id"])
@@ -622,9 +644,7 @@ def trigger_backup():
 
 @app.post("/api/clients/{client_id}/backups", status_code=202)
 def trigger_client_backup(client_id: str):
-    user = current_user_from_context()
-    if user["role"] != "admin" and user["client_id"] != client_id:
-        raise HTTPException(status_code=403, detail="You can only back up your own client data.")
+    require_admin_from_context()
     get_client(load_config(), client_id)
     return start_backup(client_id)
 
@@ -649,16 +669,19 @@ def history():
     config = load_config()
     user = current_user_from_context()
     if user["role"] == "admin":
-        return {"backups": [{**entry, "client_name": client["name"]} for client in config["clients"] for entry in client.get("history", [])]}
+        backups = [{**entry, "client_name": client["name"]} for client in config["clients"] for entry in client.get("history", [])]
+        backups.sort(key=lambda item: item.get("finished_at", item.get("started_at", "")), reverse=True)
+        return {"backups": backups}
     return {"backups": get_client(config, user["client_id"]).get("history", [])}
 
 
-def latest_s3_backup(database_name):
+def latest_s3_backup(database_name, client_id="local-database"):
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         raise HTTPException(status_code=503, detail="S3_BUCKET is not configured on the backup service.")
     prefix = os.getenv("S3_PREFIX", "cloudrecover/backups").strip("/")
-    object_prefix = f"{prefix}/{database_name}/" if prefix else f"{database_name}/"
+    client_prefix = f"clients/{client_id}/" if client_id != "local-database" else ""
+    object_prefix = f"{prefix}/{client_prefix}{database_name}/" if prefix else f"{client_prefix}{database_name}/"
     try:
         import boto3
     except ImportError as exc:
@@ -673,11 +696,14 @@ def latest_s3_backup(database_name):
 
 def restore_latest_to_new_container(restore_id):
     config = load_config()
-    client = get_client(config)
-    if client["id"] != "local-database" or client.get("source_type") != "database" or client.get("database", {}).get("type") == "mongodb":
+    restore = next((item for item in config.get("restores", []) if item.get("id") == restore_id), None)
+    if not restore:
+        raise HTTPException(status_code=404, detail="Restore job not found.")
+    client = get_client(config, restore.get("client_id"))
+    if client.get("source_type") != "database" or client.get("database", {}).get("type", "mysql-container") != "mysql-container":
         raise HTTPException(status_code=400, detail="The local Docker recovery flow currently supports database sources only. Website restoration needs a configured hosting destination.")
     db_name = client["database"]["name"]
-    bucket, client, key = latest_s3_backup(db_name)
+    bucket, client, key = latest_s3_backup(db_name, client["id"])
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     container = f"cloudrecover-restore-{timestamp}"
     volume = f"{container}-data"
@@ -745,9 +771,9 @@ def recover_latest():
     require_admin_from_context()
     config = load_config()
     client = get_client(config)
-    if client["id"] != "local-database" or client.get("source_type") != "database" or client.get("database", {}).get("type") == "mongodb":
+    if client.get("source_type") != "database" or client.get("database", {}).get("type", "mysql-container") != "mysql-container":
         raise HTTPException(status_code=400, detail="One-click recovery is currently available only for the local MySQL source.")
-    if not client["database"]["name"].replace("_", "").replace("$", "").isalnum():
+    if not client["database"]["name"].replace("_", "").replace("$", "").replace("-", "").isalnum():
         raise HTTPException(status_code=400, detail="Database name is not supported for this restore flow.")
     restore_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     with lock:

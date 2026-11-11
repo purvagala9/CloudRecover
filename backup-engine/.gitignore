@@ -1,6 +1,7 @@
 .env
 venv/
 __pycache__/
+logs/
 *.sql
 *.sql.gz
 *.sha256

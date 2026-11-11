@@ -12,6 +12,7 @@ import boto3
 from dotenv import load_dotenv
 
 load_dotenv()
+os.environ.setdefault("AWS_PROFILE", "cloudrecover-dev")
 
 # AWS configuration
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2")

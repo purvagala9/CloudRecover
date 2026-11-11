@@ -23,9 +23,11 @@ The dashboard now supports multiple client profiles in this local administration
 
 4. Make sure the backend process can access AWS credentials for the configured S3 bucket. For MongoDB Atlas or a hosted MongoDB deployment, allow the CloudRecover host's outbound IP and use a database user with only the required read/backup privileges.
 
+   CloudRecover uses the AWS CLI profile `cloudrecover-dev` by default. Set `AWS_PROFILE` before starting the backend if a different profile is required.
+
 5. For website files, configure SFTP in the client form and install the server's SSH host key into the CloudRecover user's `known_hosts`. Use a dedicated read-only SFTP account and key.
 
-6. Configure login signing and administrator credentials in `backend/.env` before starting the service:
+6. Authentication is enabled by default. Set a persistent session secret and administrator password in `backend/.env`:
 
    ```dotenv
    CLOUDRECOVER_SESSION_SECRET=<a long random secret>
@@ -33,7 +35,7 @@ The dashboard now supports multiple client profiles in this local administration
    CLOUDRECOVER_COOKIE_SECURE=true
    ```
 
-   Generate a session secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Use HTTPS when `CLOUDRECOVER_COOKIE_SECURE=true`. The administrator login ID is `admin` (also accepted: `central administration`, `central-admin`, or `ca`). Each client's login ID is its registered client name, and its initial password is `<client-name>$123` (case insensitive for the ID). These initial passwords are shared defaults; replace them with unique credentials before exposing the service publicly.
+   Generate a session secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Keep it unchanged across restarts or existing sessions will expire. Set `CLOUDRECOVER_COOKIE_SECURE=true` when serving over HTTPS. The administrator login ID is `admin` (also accepted: `central administration`, `central-admin`, or `ca`); the default password is `ca$123`. Each client's login ID is its registered client name and its initial password is `<client-name>$123` (case insensitive for the ID). Client accounts are read only. These shared initial passwords are suitable only for a prototype; change the credential setup before public deployment.
 
 7. Run the dashboard:
 
@@ -42,6 +44,8 @@ The dashboard now supports multiple client profiles in this local administration
    ```
 
 Select **Add website**, enter a client/site name, choose MongoDB, enter its database name and connection URI, and optionally configure SFTP file access. **Back Up Now** runs each configured source for the selected client. Automated schedules are per client and run only while the API process is running.
+
+To protect MySQL in a Docker container on the CloudRecover host, choose **Add local Docker**. Enter a unique profile name, the running container name, database name, and MySQL backup user. Set that user's password as `DB_PASSWORD` in `backup-engine/.env`. CloudRecover runs `mysqldump` inside the selected container and stores backups under that profile's S3 prefix. Select the profile to run backups or restore its latest verified backup.
 
 ## Current boundaries
 

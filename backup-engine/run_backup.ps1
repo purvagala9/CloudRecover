@@ -1,8 +1,8 @@
 
 $ErrorActionPreference = "Stop"
 
-# CloudRecover project paths
-$ProjectDir = "C:\Users\Lenovo\Desktop\ccbdi_project\CloudRecover\backup-engine"
+# Resolve project paths relative to this script so it also works after cloning elsewhere.
+$ProjectDir = $PSScriptRoot
 $Python = Join-Path $ProjectDir "venv\Scripts\python.exe"
 $LogDir = Join-Path $ProjectDir "logs"
 $LogFile = Join-Path $LogDir "backup.log"
@@ -16,8 +16,10 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 try {
     Set-Location $ProjectDir
 
-    # Select the AWS profile used by CloudRecover
-    $env:AWS_PROFILE = "cloudrecover-dev"
+    # Use the CloudRecover profile unless the caller selected another one.
+    if (-not $env:AWS_PROFILE) {
+        $env:AWS_PROFILE = "cloudrecover-dev"
+    }
 
     # Verify Docker is available
     & docker info 2>&1 |
