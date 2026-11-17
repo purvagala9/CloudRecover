@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -208,6 +209,33 @@ def perform_backup(source="manual", client_id=None):
         return entry
 
 
+def resolve_mongo_tool(tool_name):
+    configured = os.getenv(f"{tool_name.upper()}_BIN", "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.is_file():
+            return str(configured_path)
+        located = shutil.which(configured)
+        if located:
+            return located
+    if tool_name == "mongorestore":
+        dump_path = Path(os.getenv("MONGODUMP_BIN", "")).expanduser()
+        sibling = dump_path.with_name("mongorestore.exe") if dump_path.suffix.lower() == ".exe" else dump_path.with_name("mongorestore")
+        if sibling.is_file():
+            return str(sibling)
+    located = shutil.which(tool_name)
+    if located:
+        return located
+    local_app_data = os.getenv("LOCALAPPDATA", "")
+    if local_app_data:
+        installed_tools = Path(local_app_data) / "CloudRecover" / "MongoDBTools"
+        executable = f"{tool_name}.exe" if os.name == "nt" else tool_name
+        match = next((path for path in installed_tools.glob(f"*/bin/{executable}") if path.is_file()), None)
+        if match:
+            return str(match)
+    raise RuntimeError(f"{tool_name} is unavailable. Install MongoDB Database Tools, add it to PATH, or set {tool_name.upper()}_BIN in backend/.env.")
+
+
 def perform_website_backup(client, source):
     site = client["website"]
     if not site.get("host") or not site.get("username") or not site.get("remote_path") or not site.get("private_key_path"):
@@ -293,6 +321,7 @@ def perform_mongodb_backup(client, source):
         raise RuntimeError(f"Could not load the encrypted MongoDB connection. {str(exc)[:250]}") from exc
     started = datetime.now(timezone.utc)
     timestamp = started.strftime("%Y%m%dT%H%M%SZ")
+    mongodump_bin = resolve_mongo_tool("mongodump")
     with tempfile.TemporaryDirectory(prefix="cloudrecover-mongo-") as folder:
         work = Path(folder)
         archive = work / "mongodb.archive.gz"
@@ -300,7 +329,7 @@ def perform_mongodb_backup(client, source):
         # mongodump supports a config file for sensitive URI values; keep it only in a temporary directory.
         config_file.write_text("uri: " + json.dumps(uri) + "\n", encoding="utf-8")
         try:
-            result = subprocess.run([os.getenv("MONGODUMP_BIN", "mongodump"), "--config", str(config_file), "--db", mongo["database"], "--archive", str(archive), "--gzip"], capture_output=True, text=True, timeout=3600)
+            result = subprocess.run([mongodump_bin, "--config", str(config_file), "--db", mongo["database"], f"--archive={archive}", "--gzip"], capture_output=True, text=True, timeout=3600)
         except FileNotFoundError as exc:
             raise RuntimeError("mongodump is not installed or is not available on the CloudRecover host PATH.") from exc
         finally:
@@ -439,6 +468,11 @@ class LoginInput(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
 def public_client(client):
     return {
         "id": client["id"], "name": client["name"], "website_url": client.get("website_url", ""),
@@ -462,7 +496,12 @@ def dashboard():
 def login(credentials: LoginInput, response: Response):
     username = credentials.username.strip()
     password = credentials.password
-    if username.casefold() in {"central administration", "central-admin", "admin", "ca"} and hmac.compare_digest(password, os.getenv("CLOUDRECOVER_ADMIN_PASSWORD", "ca$123")):
+    if username.casefold() in {"central administration", "central-admin", "admin", "ca"}:
+        config = load_config()
+        stored_hash = config.get("admin_password_hash", "")
+        valid = verify_password(password, stored_hash) if stored_hash else hmac.compare_digest(password, os.getenv("CLOUDRECOVER_ADMIN_PASSWORD", "ca$123"))
+        if not valid:
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
         role, client_id, display_name = "admin", None, "Central administration"
     else:
         config = load_config()
@@ -470,7 +509,8 @@ def login(credentials: LoginInput, response: Response):
         if len(matches) != 1:
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         client = matches[0]
-        if not hmac.compare_digest(password, client["name"] + "$123"):
+        valid = verify_password(password, client.get("password_hash", "")) if client.get("password_hash") else hmac.compare_digest(password, client["name"] + "$123")
+        if not valid:
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         role, client_id, display_name = "client", client["id"], client["name"]
     response.set_cookie(SESSION_COOKIE, make_session(role, client_id), httponly=True, secure=os.getenv("CLOUDRECOVER_COOKIE_SECURE", "false").lower() == "true", samesite="strict", max_age=SESSION_TTL_SECONDS, path="/")
@@ -481,6 +521,45 @@ def login(credentials: LoginInput, response: Response):
 def logout(response: Response):
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"status": "signed out"}
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+    return base64.urlsafe_b64encode(salt + digest).decode()
+
+
+def verify_password(password, encoded):
+    try:
+        raw = base64.urlsafe_b64decode(encoded.encode())
+        salt, expected = raw[:16], raw[16:]
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+@app.put("/api/account/password")
+def change_password(update: PasswordChange, response: Response):
+    user = current_user_from_context()
+    with lock:
+        config = load_config()
+        if user["role"] == "admin":
+            encoded = config.get("admin_password_hash", "")
+            valid = verify_password(update.current_password, encoded) if encoded else hmac.compare_digest(update.current_password, os.getenv("CLOUDRECOVER_ADMIN_PASSWORD", "ca$123"))
+            if not valid:
+                raise HTTPException(status_code=400, detail="Current password is incorrect.")
+            config["admin_password_hash"] = hash_password(update.new_password)
+        else:
+            client = get_client(config, user["client_id"])
+            encoded = client.get("password_hash", "")
+            valid = verify_password(update.current_password, encoded) if encoded else hmac.compare_digest(update.current_password, client["name"] + "$123")
+            if not valid:
+                raise HTTPException(status_code=400, detail="Current password is incorrect.")
+            client["password_hash"] = hash_password(update.new_password)
+        save_config(config)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"status": "password changed; sign in again"}
 
 
 @app.get("/api/session")
@@ -577,6 +656,21 @@ def select_client(client_id: str):
         config["selected_client_id"] = client_id
         save_config(config)
     return {"selected_client_id": client_id}
+
+
+@app.delete("/api/clients/{client_id}")
+def delete_client(client_id: str):
+    require_admin_from_context()
+    with lock:
+        config = load_config()
+        client = get_client(config, client_id)
+        if len(config["clients"]) <= 1:
+            raise HTTPException(status_code=400, detail="At least one client profile must remain.")
+        config["clients"] = [item for item in config["clients"] if item["id"] != client_id]
+        if config["selected_client_id"] == client_id:
+            config["selected_client_id"] = config["clients"][0]["id"]
+        save_config(config)
+    return {"removed": client_id, "name": client["name"]}
 
 
 @app.put("/api/automation")
@@ -765,24 +859,114 @@ def restore_latest_to_new_container(restore_id):
     return {"status": "success", "container": container, "volume": volume, "database": db_name, "root_password": password, "source_key": key, "restored_at": restored_at, "tables": [table for table in check.stdout.splitlines() if table]}
 
 
+def latest_mongodb_backup(client):
+    return next((entry for entry in client.get("history", []) if entry.get("status") == "success" and entry.get("source_type") == "mongodb" and entry.get("s3_key")), None)
+
+
+def restore_latest_mongodb_to_new_database(restore_id):
+    config = load_config()
+    restore = next((item for item in config.get("restores", []) if item.get("id") == restore_id), None)
+    if not restore:
+        raise HTTPException(status_code=404, detail="Restore job not found.")
+    client = get_client(config, restore.get("client_id"))
+    mongo = client.get("mongo", {})
+    if not mongo.get("uri_encrypted"):
+        raise HTTPException(status_code=400, detail="This client has no configured MongoDB connection.")
+    backup = latest_mongodb_backup(client)
+    if not backup:
+        raise HTTPException(status_code=404, detail="No successful MongoDB backup is available to restore.")
+    source_database = mongo.get("database", "")
+    if not source_database or any(char in source_database for char in ".*\\\0"):
+        raise HTTPException(status_code=422, detail="The configured MongoDB database name cannot be used for a namespace restore.")
+    restore_database = f"cr_restore_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+    if len(restore_database.encode("utf-8")) > 38:
+        raise HTTPException(status_code=422, detail="Generated MongoDB restore database name exceeds the provider limit.")
+    try:
+        import boto3
+        uri = encryption_fernet().decrypt(mongo["uri_encrypted"].encode()).decode()
+    except Exception as exc:
+        raise RuntimeError("Could not load the encrypted MongoDB connection or S3 client.") from exc
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="S3_BUCKET is not configured on the backup service.")
+    s3client = boto3.client("s3", region_name=os.getenv("AWS_REGION", "ap-southeast-2"))
+    source_key = backup["s3_key"]
+    with lock:
+        current = load_config()
+        record = next((item for item in current.get("restores", []) if item.get("id") == restore_id), None)
+        if record:
+            record.update({"source_database": source_database, "database": restore_database, "source_key": source_key})
+            save_config(current)
+    with tempfile.TemporaryDirectory(prefix="cloudrecover-mongo-restore-") as folder:
+        archive = Path(folder) / "mongodb.archive.gz"
+        config_file = Path(folder) / "mongorestore.yaml"
+        config_file.write_text("uri: " + json.dumps(uri) + "\n", encoding="utf-8")
+        try:
+            sidecar = s3client.get_object(Bucket=bucket, Key=source_key + ".sha256")["Body"].read().decode("utf-8", errors="replace")
+            expected = sidecar.split()[0] if sidecar.split() else ""
+            if not expected:
+                raise HTTPException(status_code=422, detail="The MongoDB backup has no readable checksum sidecar; restore was stopped.")
+            s3client.download_file(bucket, source_key, str(archive))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            if not hmac.compare_digest(digest, expected):
+                raise HTTPException(status_code=422, detail="MongoDB backup checksum verification failed; restore was stopped.")
+            command = [
+                resolve_mongo_tool("mongorestore"),
+                "--config", str(config_file),
+                f"--archive={archive}",
+                "--gzip",
+                f"--nsFrom={source_database}.*",
+                f"--nsTo={restore_database}.*",
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).replace(uri, "[MongoDB URI redacted]")
+                raise RuntimeError(f"mongorestore failed: {detail[-1500:]}")
+        finally:
+            config_file.unlink(missing_ok=True)
+    return {
+        "status": "success",
+        "restore_type": "mongodb",
+        "source_database": source_database,
+        "database": restore_database,
+        "source_key": source_key,
+        "restored_at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"MongoDB backup restored into {restore_database} on the configured MongoDB cluster. The original database was left unchanged.",
+    }
+
+
 @app.post("/api/recovery/latest")
 def recover_latest():
-    """Restore the newest checksum-verified SQL backup into a fresh local Docker container."""
+    """Restore the latest verified backup into an isolated database or container."""
     require_admin_from_context()
     config = load_config()
     client = get_client(config)
-    if client.get("source_type") != "database" or client.get("database", {}).get("type", "mysql-container") != "mysql-container":
-        raise HTTPException(status_code=400, detail="One-click recovery is currently available only for the local MySQL source.")
-    if not client["database"]["name"].replace("_", "").replace("$", "").replace("-", "").isalnum():
-        raise HTTPException(status_code=400, detail="Database name is not supported for this restore flow.")
+    is_mongodb = bool(client.get("mongo", {}).get("uri_encrypted"))
+    if is_mongodb:
+        backup = latest_mongodb_backup(client)
+        if not backup:
+            raise HTTPException(status_code=404, detail="No successful MongoDB backup is available to restore.")
+        restore_type = "mongodb"
+        source_database = client["mongo"].get("database", "")
+        if not source_database or any(char in source_database for char in ".*\\\0"):
+            raise HTTPException(status_code=422, detail="The configured MongoDB database name cannot be used for a namespace restore.")
+        details = {"source_database": source_database, "source_key": backup["s3_key"]}
+    else:
+        if client.get("source_type") != "database" or client.get("database", {}).get("type", "mysql-container") != "mysql-container":
+            raise HTTPException(status_code=400, detail="Recovery is available for configured MongoDB clients and local Docker MySQL profiles.")
+        database_name = client["database"]["name"]
+        if not database_name.replace("_", "").replace("$", "").replace("-", "").isalnum():
+            raise HTTPException(status_code=400, detail="Database name is not supported for this restore flow.")
+        restore_type = "mysql"
+        details = {"database": database_name}
     restore_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     with lock:
-        config.setdefault("restores", []).insert(0, {"id": restore_id, "status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "database": client["database"]["name"], "client_id": client["id"]})
+        config.setdefault("restores", []).insert(0, {"id": restore_id, "status": "running", "restore_type": restore_type, "started_at": datetime.now(timezone.utc).isoformat(), "client_id": client["id"], **details})
         save_config(config)
 
     def run_restore():
         try:
-            result = restore_latest_to_new_container(restore_id)
+            result = restore_latest_mongodb_to_new_database(restore_id) if restore_type == "mongodb" else restore_latest_to_new_container(restore_id)
         except Exception as exc:
             result = {"status": "failed", "detail": str(exc.detail if isinstance(exc, HTTPException) else exc)[:1500]}
         with lock:

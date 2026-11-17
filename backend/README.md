@@ -43,7 +43,7 @@ The dashboard now supports multiple client profiles in this local administration
    .\venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
    ```
 
-Select **Add website**, enter a client/site name, choose MongoDB, enter its database name and connection URI, and optionally configure SFTP file access. **Back Up Now** runs each configured source for the selected client. Automated schedules are per client and run only while the API process is running.
+Select **Add website**, enter a client/site name, database name, and MongoDB connection URI. **Back Up Now** creates a compressed MongoDB archive and uploads it to S3. Automated schedules are per client and run only while the API process is running.
 
 To protect MySQL in a Docker container on the CloudRecover host, choose **Add local Docker**. Enter a unique profile name, the running container name, database name, and MySQL backup user. Set that user's password as `DB_PASSWORD` in `backup-engine/.env`. CloudRecover runs `mysqldump` inside the selected container and stores backups under that profile's S3 prefix. Select the profile to run backups or restore its latest verified backup.
 
@@ -51,6 +51,6 @@ To protect MySQL in a Docker container on the CloudRecover host, choose **Add lo
 
 - Central administration can inspect all registered clients and cross-client backup activity. Client accounts are bound to one registered client, and all API routes enforce that scope server side. Recovery controls and client management are administrator only.
 - MongoDB backups require `mongodump` on the CloudRecover host and network access from that host to MongoDB. They are uploaded with S3 server-side encryption and a SHA-256 sidecar.
-- Website file backup currently uses SFTP. A website database can be backed up through its MongoDB URI; provider-specific website databases such as managed MySQL/PostgreSQL need additional connectors.
-- Restore creates a separate local MySQL 8.4 Docker container and volume, verifies the backup checksum, and imports the SQL dump. Each restore gets a generated root password saved in `cloudrecover.json` and shown in Recovery activity; keep that file private. Connect with `docker exec -it <container> mysql -uroot -p` (then enter the displayed password). MongoDB restore and deploying website files back to a hosting provider are not implemented yet.
+- MongoDB recovery requires `mongorestore`, access to the backup in S3, and a MongoDB account allowed to create and write to a new database. Recovery verifies the checksum and restores into a uniquely named `cloudrecover_restore_<timestamp>` database on the configured MongoDB cluster; it leaves the source database unchanged. Review the new database in your MongoDB administration tool after recovery.
+- MySQL recovery creates a separate local MySQL 8.4 Docker container and volume, verifies the backup checksum, and imports the SQL dump. Each restore gets a generated root password saved in `cloudrecover.json` and shown in Recovery activity; keep that file private. Connect with `docker exec -it <container> mysql -uroot -p` (then enter the displayed password). Deploying website files back to a hosting provider is not implemented.
 - SFTP and MongoDB are recorded as separate artifacts/history entries. If one source fails, a successful artifact from the other source may still exist.
