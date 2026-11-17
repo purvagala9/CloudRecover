@@ -5,7 +5,7 @@ CloudRecover backs up configured databases and website files to Amazon S3 and ke
 ## Quick start
 
 1. Install backend dependencies with `python -m pip install -r backend/requirements.txt`.
-2. Copy `backend/.env.example` to `backend/.env` and configure the encryption key, a persistent `CLOUDRECOVER_SESSION_SECRET`, and AWS access. The prototype administrator password defaults to `ca$123`.
+2. Copy `backend/.env.example` to `backend/.env` and configure the encryption key, a persistent `CLOUDRECOVER_SESSION_SECRET`, and AWS access.
 3. Start the API from the `backend` directory with `python -m uvicorn main:app --host 127.0.0.1 --port 8000`.
 4. Sign in as `admin`. Client IDs are their registered names; initial passwords are `<client-name>$123`.
 
